@@ -1,0 +1,1188 @@
+import { useState, useEffect, useMemo, useRef } from "react";
+import {
+  LayoutDashboard, CalendarDays, Users, Stethoscope, FlaskConical, FileText,
+  Wallet, MessageCircle, BarChart3, UserCog, Settings, Sun, Moon, LogOut,
+  Plus, X, Clock, ChevronLeft, ChevronRight, AlertTriangle, Search, Lock,
+  Mail, Eye, EyeOff, ArrowLeft, Pencil, Archive, FilePlus, Phone, Home,
+  HeartPulse, ShieldCheck, Droplet, Baby, CalendarClock, CircleUserRound,
+  TrendingUp, CheckCircle2, XCircle, Sparkles, ClipboardList, Bell, Lock as LockIcon
+} from "lucide-react";
+
+/* ============================= CONSTANTS ============================= */
+
+const ROLES = ["Administradora", "Médica", "Secretaria"];
+
+const ROLE_PERMISSIONS = {
+  "Administradora": { agenda: "full", pacientes: "full", prontuario: "none" },
+  "Médica": { agenda: "view", pacientes: "view", prontuario: "full" },
+  "Secretaria": { agenda: "full", pacientes: "full", prontuario: "none" },
+};
+
+const NAV_ITEMS = [
+  { key: "dashboard", label: "Dashboard", icon: LayoutDashboard, ready: true },
+  { key: "agenda", label: "Agenda", icon: CalendarDays, ready: true },
+  { key: "pacientes", label: "Pacientes", icon: Users, ready: true },
+  { key: "prontuarios", label: "Prontuário", icon: Stethoscope, ready: true, restrict: "prontuario" },
+  { key: "exames", label: "Exames", icon: FlaskConical, ready: false },
+  { key: "prescricoes", label: "Prescrições e Documentos", icon: FileText, ready: false },
+  { key: "financeiro", label: "Financeiro", icon: Wallet, ready: false },
+  { key: "comunicacao", label: "Comunicação", icon: MessageCircle, ready: false },
+  { key: "relatorios", label: "Relatórios", icon: BarChart3, ready: false },
+  { key: "usuarios", label: "Usuários e Permissões", icon: UserCog, ready: false },
+  { key: "configuracoes", label: "Configurações", icon: Settings, ready: false },
+];
+
+const APPT_TYPES = [
+  "Consulta ginecológica",
+  "Consulta de retorno",
+  "Consulta preventiva",
+  "Consulta obstétrica",
+  "Teleconsulta",
+];
+
+const STATUSES = ["Agendado", "Confirmado", "Em atendimento", "Realizada", "Cancelada", "Faltou", "Reagendada"];
+
+const STATUS_STYLE = {
+  "Agendado": { bg: "rgba(61,90,115,0.12)", fg: "#3D5A73", dot: "#3D5A73" },
+  "Confirmado": { bg: "rgba(21,128,61,0.12)", fg: "#15803D", dot: "#22C55E" },
+  "Em atendimento": { bg: "rgba(37,99,235,0.12)", fg: "#1D4ED8", dot: "#3B82F6" },
+  "Realizada": { bg: "rgba(107,114,128,0.14)", fg: "#4B5563", dot: "#6B7280" },
+  "Cancelada": { bg: "rgba(220,38,38,0.12)", fg: "#B91C1C", dot: "#EF4444" },
+  "Faltou": { bg: "rgba(217,119,6,0.12)", fg: "#B45309", dot: "#F59E0B" },
+  "Reagendada": { bg: "rgba(147,51,234,0.12)", fg: "#7E22CE", dot: "#A855F7" },
+};
+
+const DURATIONS = [20, 30, 45, 60];
+
+const WEEKDAY_LABELS = ["Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sáb"];
+const MONTH_LABELS = [
+  "Janeiro", "Fevereiro", "Março", "Abril", "Maio", "Junho",
+  "Julho", "Agosto", "Setembro", "Outubro", "Novembro", "Dezembro",
+];
+
+/* ============================= HELPERS ============================= */
+
+function pad(n) { return String(n).padStart(2, "0"); }
+function toISODate(d) { return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; }
+function toMinutes(hhmm) { const [h, m] = hhmm.split(":").map(Number); return h * 60 + m; }
+function fmtDateLong(iso) {
+  const d = new Date(iso + "T00:00:00");
+  return `${WEEKDAY_LABELS[d.getDay()]}, ${d.getDate()} de ${MONTH_LABELS[d.getMonth()]}`;
+}
+function fmtDateShort(iso) {
+  if (!iso) return "—";
+  const d = new Date(iso + "T00:00:00");
+  return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()}`;
+}
+function addDays(iso, n) {
+  const d = new Date(iso + "T00:00:00");
+  d.setDate(d.getDate() + n);
+  return toISODate(d);
+}
+function startOfWeek(iso) {
+  const d = new Date(iso + "T00:00:00");
+  d.setDate(d.getDate() - d.getDay());
+  return toISODate(d);
+}
+function isSameMonth(iso, year, month) {
+  const d = new Date(iso + "T00:00:00");
+  return d.getFullYear() === year && d.getMonth() === month;
+}
+function overlaps(startA, durA, startB, durB) {
+  const aStart = toMinutes(startA), aEnd = aStart + durA;
+  const bStart = toMinutes(startB), bEnd = bStart + durB;
+  return aStart < bEnd && bStart < aEnd;
+}
+function calcAge(birthDate) {
+  if (!birthDate) return null;
+  const b = new Date(birthDate + "T00:00:00");
+  const now = new Date();
+  let age = now.getFullYear() - b.getFullYear();
+  const m = now.getMonth() - b.getMonth();
+  if (m < 0 || (m === 0 && now.getDate() < b.getDate())) age--;
+  return age;
+}
+function daysSince(iso) {
+  if (!iso) return null;
+  const a = new Date(iso + "T00:00:00");
+  const b = new Date();
+  return Math.floor((b - a) / 86400000);
+}
+
+/* ============================= STORAGE ============================= */
+
+async function loadJSON(key, fallback) {
+  try {
+    const res = await window.storage.get(key, false);
+    if (res && res.value) return JSON.parse(res.value);
+    return fallback;
+  } catch (e) { return fallback; }
+}
+async function saveJSON(key, value) {
+  try { await window.storage.set(key, JSON.stringify(value), false); } catch (e) {}
+}
+
+/* ============================= SEED DATA ============================= */
+
+function seedPatients() {
+  return [
+    { id: "pt1", name: "Larissa Khoury", cpf: "123.456.789-00", birthDate: "1991-04-12", phone: "(71) 98211-3040", whatsapp: "(71) 98211-3040", email: "larissa@email.com", address: "Rua das Palmeiras, 120 — Salvador/BA", emergencyContact: "Pedro Khoury — (71) 99887-1234", alergias: "Nenhuma conhecida", medicamentos: "Anticoncepcional oral", antecedentesFamiliares: "Mãe com histórico de câncer de mama.", archived: false },
+    { id: "pt2", name: "Camila Torres", cpf: "234.567.890-11", birthDate: "1986-09-05", phone: "(71) 97744-1122", whatsapp: "(71) 97744-1122", email: "camila@email.com", address: "Av. Oceânica, 980 — Salvador/BA", emergencyContact: "José Torres — (71) 98123-4455", alergias: "Dipirona", medicamentos: "Nenhum", antecedentesFamiliares: "Sem antecedentes relevantes.", archived: false },
+    { id: "pt3", name: "Vanessa Prado", cpf: "345.678.901-22", birthDate: "1996-12-18", phone: "(71) 99123-5566", whatsapp: "(71) 99123-5566", email: "vanessa@email.com", address: "Rua Girassol, 55 — Salvador/BA", emergencyContact: "Marcos Prado — (71) 97321-8899", alergias: "Nenhuma conhecida", medicamentos: "Nenhum", antecedentesFamiliares: "Avó com diabetes tipo 2.", archived: false },
+    { id: "pt4", name: "Juliana Reis", cpf: "456.789.012-33", birthDate: "1979-06-30", phone: "(71) 98890-7712", whatsapp: "(71) 98890-7712", email: "juliana@email.com", address: "Rua Tabapuã, 415 — Salvador/BA", emergencyContact: "Sueli Reis — (71) 96677-2233", alergias: "Látex", medicamentos: "Losartana", antecedentesFamiliares: "Pai hipertenso.", archived: false },
+  ];
+}
+
+function seedAppointments() {
+  const today = toISODate(new Date());
+  return [
+    { id: "a1", patientId: "pt1", patientName: "Larissa Khoury", date: today, time: "08:30", type: "Consulta ginecológica", duration: 30, status: "Confirmado", notes: "" },
+    { id: "a2", patientId: "pt2", patientName: "Camila Torres", date: today, time: "09:15", type: "Consulta preventiva", duration: 30, status: "Agendado", notes: "" },
+    { id: "a3", patientId: "pt3", patientName: "Vanessa Prado", date: today, time: "10:30", type: "Consulta obstétrica", duration: 45, status: "Em atendimento", notes: "Acompanhamento pré-natal." },
+    { id: "a4", patientId: "pt4", patientName: "Juliana Reis", date: today, time: "14:00", type: "Consulta de retorno", duration: 20, status: "Agendado", notes: "" },
+    { id: "a5", patientId: "pt1", patientName: "Larissa Khoury", date: addDays(today, -7), time: "11:00", type: "Consulta ginecológica", duration: 30, status: "Realizada", notes: "" },
+    { id: "a6", patientId: "pt2", patientName: "Camila Torres", date: addDays(today, -3), time: "09:00", type: "Consulta de retorno", duration: 20, status: "Faltou", notes: "" },
+    { id: "a7", patientId: "pt3", patientName: "Vanessa Prado", date: addDays(today, 1), time: "08:30", type: "Consulta obstétrica", duration: 45, status: "Confirmado", notes: "" },
+    { id: "a8", patientId: "pt4", patientName: "Juliana Reis", date: addDays(today, 2), time: "15:30", type: "Teleconsulta", duration: 20, status: "Agendado", notes: "" },
+    { id: "a9", patientId: "pt1", patientName: "Larissa Khoury", date: addDays(today, -14), time: "10:00", type: "Consulta preventiva", duration: 30, status: "Realizada", notes: "" },
+    { id: "a10", patientId: "pt2", patientName: "Camila Torres", date: addDays(today, -1), time: "16:00", type: "Consulta ginecológica", duration: 30, status: "Cancelada", notes: "" },
+  ];
+}
+
+function seedRecords() {
+  const today = toISODate(new Date());
+  return [
+    {
+      id: "r1", patientId: "pt3", patientName: "Vanessa Prado", date: addDays(today, -14), professional: "Dra. Isabela",
+      queixaPrincipal: "Consulta de rotina de pré-natal, 24 semanas.", sintomas: "Sem queixas relevantes, leve edema em membros inferiores.",
+      dum: "2026-05-28", cicloMenstrual: "Gestação em curso — ciclo suspenso.",
+      gestacoes: 2, partos: 1, abortos: 0, historicoContraceptivo: "Suspenso durante a gestação atual.",
+      historicoSexual: "", antecedentesPessoais: "Sem comorbidades.",
+      alergias: "Nenhuma conhecida", medicamentos: "Ácido fólico, sulfato ferroso",
+      exameFisico: "Abdome gravídico compatível com idade gestacional. Ausculta fetal presente.",
+      sinaisVitais: "PA 110/70 mmHg · FC 78 bpm · Peso 68 kg",
+      diagnosticos: "Gestação tópica de 24 semanas, evolução normal.",
+      evolucaoClinica: "Gestação de evolução favorável, sem intercorrências.",
+      condutaMedica: "Manter suplementação, retorno em 4 semanas, solicitar USG morfológico se ainda não realizado.",
+      historicoProcedimentos: "Nenhum procedimento cirúrgico prévio relevante.",
+      observacoes: "Paciente orientada sobre sinais de alerta na gestação.",
+    },
+    {
+      id: "r2", patientId: "pt1", patientName: "Larissa Khoury", date: addDays(today, -7), professional: "Dra. Isabela",
+      queixaPrincipal: "Consulta ginecológica de rotina, acompanhamento anual.", sintomas: "Nenhuma queixa no momento.",
+      dum: addDays(today, -20), cicloMenstrual: "Regular, ciclos de 28 dias.",
+      gestacoes: 0, partos: 0, abortos: 0, historicoContraceptivo: "Anticoncepcional oral combinado, uso contínuo há 3 anos.",
+      historicoSexual: "", antecedentesPessoais: "Sem comorbidades relevantes.",
+      alergias: "Nenhuma conhecida", medicamentos: "Anticoncepcional oral",
+      exameFisico: "Exame especular sem alterações. Colo uterino de aspecto normal.",
+      sinaisVitais: "PA 112/72 mmHg · FC 70 bpm · Peso 61 kg",
+      diagnosticos: "Exame ginecológico sem alterações.",
+      evolucaoClinica: "Paciente assintomática, acompanhamento de rotina.",
+      condutaMedica: "Solicitado Papanicolau de rotina, retorno em 1 ano.",
+      historicoProcedimentos: "Nenhum.",
+      observacoes: "",
+    },
+  ];
+}
+
+/* ============================= AI-STYLE SUMMARY (rule-based) ============================= */
+
+function buildSmartSummary(patient, records) {
+  if (!patient) return null;
+  const sorted = [...records].sort((a, b) => b.date.localeCompare(a.date));
+  const last = sorted[0];
+  const missing = [];
+  const lines = [];
+
+  const age = calcAge(patient.birthDate);
+  lines.push(`${patient.name}${age != null ? `, ${age} anos` : ""}.`);
+
+  if (last) {
+    lines.push(`Última consulta em ${fmtDateLong(last.date)} — queixa: ${last.queixaPrincipal || "não registrada"}.`);
+    if (last.dum) lines.push(`DUM: ${fmtDateShort(last.dum)}${daysSince(last.dum) != null ? ` (${daysSince(last.dum)} dias atrás)` : ""}.`);
+    const g = last.gestacoes ?? 0, p = last.partos ?? 0, a = last.abortos ?? 0;
+    lines.push(`Histórico obstétrico: G${g}P${p}A${a}.`);
+    if (last.diagnosticos) lines.push(`Diagnóstico mais recente: ${last.diagnosticos}`);
+    if (last.condutaMedica) lines.push(`Conduta: ${last.condutaMedica}`);
+  } else {
+    lines.push("Nenhum registro de prontuário ainda — esta será a primeira consulta documentada.");
+  }
+
+  const alergias = last?.alergias || patient.alergias;
+  if (alergias && alergias.toLowerCase() !== "nenhuma conhecida" && alergias.trim() !== "") {
+    lines.push(`⚠ Alergia registrada: ${alergias}.`);
+  }
+  if (patient.antecedentesFamiliares) lines.push(`Antecedentes familiares: ${patient.antecedentesFamiliares}`);
+
+  if (!patient.cpf) missing.push("CPF");
+  if (!patient.alergias) missing.push("Alergias (cadastro)");
+  if (!last) missing.push("Nenhuma avaliação clínica registrada ainda");
+  else {
+    if (!last.dum) missing.push("Data da última menstruação");
+    if (!last.sinaisVitais) missing.push("Sinais vitais");
+    if (!last.condutaMedica) missing.push("Conduta médica");
+  }
+
+  return { text: lines.join(" "), missing };
+}
+
+/* ============================= THEME STYLES ============================= */
+
+function ThemeStyles() {
+  return (
+    <style>{`
+      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+      .gi-root{ font-family:'Inter',sans-serif; }
+      .gi-root.theme-light{
+        --bg:#F3F5F7; --panel:#FFFFFF; --panel-2:#F0F2F5;
+        --border:rgba(31,41,55,0.09); --text:#1F2937;
+        --text-soft:rgba(31,41,55,0.62); --text-faint:rgba(31,41,55,0.42);
+        --sidebar-bg:#1C2B38; --primary:#3D5A73; --primary-light:#577089;
+      }
+      .gi-root.theme-dark{
+        --bg:#0D1620; --panel:#152130; --panel-2:#1A2838;
+        --border:rgba(255,255,255,0.08); --text:#E7ECF1;
+        --text-soft:rgba(231,236,241,0.62); --text-faint:rgba(231,236,241,0.4);
+        --sidebar-bg:#0A1118; --primary:#5B84A3; --primary-light:#7CA0BC;
+      }
+      .gi-bg{ background:var(--bg); color:var(--text); }
+      .gi-panel{ background:var(--panel); border:1px solid var(--border); }
+      .gi-panel-2{ background:var(--panel-2); border:1px solid var(--border); }
+      .gi-text{ color:var(--text); }
+      .gi-text-soft{ color:var(--text-soft); }
+      .gi-text-faint{ color:var(--text-faint); }
+      .gi-primary{ color:var(--primary); }
+
+      .gi-btn-primary{
+        background:var(--primary); color:#fff; font-weight:700; border:none; cursor:pointer;
+        transition:background .15s ease, transform .15s ease;
+      }
+      .gi-btn-primary:hover{ background:var(--primary-light); transform:translateY(-1px); }
+      .gi-btn-primary:disabled{ opacity:0.5; cursor:not-allowed; transform:none; }
+
+      .gi-btn-ghost{ background:transparent; border:1px solid var(--border); color:var(--text); cursor:pointer; transition:background .15s ease; }
+      .gi-btn-ghost:hover{ background:var(--panel-2); }
+
+      .gi-input{ background:var(--panel-2); border:1px solid var(--border); color:var(--text); outline:none; transition:border-color .15s ease; }
+      .gi-input:focus{ border-color:var(--primary); }
+      .gi-input::placeholder{ color:var(--text-faint); }
+
+      .gi-nav-item{ color:rgba(231,236,241,0.68); transition:background .15s ease, color .15s ease; }
+      .gi-nav-item:hover{ background:rgba(255,255,255,0.06); color:#fff; }
+      .gi-nav-item.active{ background:rgba(255,255,255,0.10); color:#fff; }
+      .gi-nav-item.disabled{ opacity:0.38; cursor:default; }
+      .gi-nav-item.disabled:hover{ background:transparent; color:rgba(231,236,241,0.68); }
+
+      .gi-badge-green{ background:#DCFCE7; color:#15803D; }
+      .gi-scroll::-webkit-scrollbar{ width:8px; height:8px; }
+      .gi-scroll::-webkit-scrollbar-thumb{ background:var(--border); border-radius:8px; }
+
+      .gi-fade-in{ animation:giFadeIn .25s ease both; }
+      @keyframes giFadeIn{ from{opacity:0; transform:translateY(6px);} to{opacity:1; transform:translateY(0);} }
+      @media (prefers-reduced-motion: reduce){ *{ animation:none !important; transition:none !important; } }
+    `}</style>
+  );
+}
+
+/* ============================= LOGIN ============================= */
+
+function LoginScreen({ theme, toggleTheme, onLogin }) {
+  const [email, setEmail] = useState("");
+  const [senha, setSenha] = useState("");
+  const [role, setRole] = useState("Médica");
+  const [showPw, setShowPw] = useState(false);
+  const [error, setError] = useState("");
+
+  function handleSubmit(e) {
+    e.preventDefault();
+    if (!email.trim() || !senha.trim()) { setError("Informe e-mail/usuário e senha para continuar."); return; }
+    if (role === "Administradora" && (email.trim() !== "admin" || senha !== "admin")) {
+      setError("Usuário ou senha incorretos para o perfil Administradora.");
+      return;
+    }
+    if (role === "Médica" && email.trim().toLowerCase() !== "dr. isabela") {
+      setError('Usuário incorreto para o perfil Médica. Use "Dr. Isabela".');
+      return;
+    }
+    setError("");
+    onLogin({ email: role === "Médica" ? "Dra. Isabela" : email, role });
+  }
+
+  const fieldLabelStyle = { fontSize: "0.72rem", fontWeight: 600, letterSpacing: "0.04em", textTransform: "uppercase" };
+  const inputWrap = { position: "relative", marginTop: 6, marginBottom: 16 };
+  const inputStyle = { width: "100%", padding: "11px 12px 11px 38px", borderRadius: 10, fontSize: "0.92rem" };
+
+  return (
+    <div className="gi-root theme-light gi-bg" style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", padding: 24 }}>
+      <ThemeStyles />
+      <button onClick={toggleTheme} className="gi-btn-ghost" style={{ position: "absolute", top: 20, right: 20, width: 40, height: 40, borderRadius: 999, display: "flex", alignItems: "center", justifyContent: "center" }}>
+        {theme === "dark" ? <Sun size={18} /> : <Moon size={18} />}
+      </button>
+
+      <div style={{ width: "100%", maxWidth: 400 }} className="gi-fade-in">
+        <div style={{ display: "flex", alignItems: "center", gap: 12, justifyContent: "center", marginBottom: 26 }}>
+          <div style={{ width: 48, height: 48, borderRadius: 12, background: "var(--primary)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+            <Stethoscope size={24} color="#fff" />
+          </div>
+          <div>
+            <div className="gi-text" style={{ fontWeight: 800, fontSize: "1.15rem", lineHeight: 1.1 }}>Gestão Ginecológica</div>
+            <div className="gi-text-faint" style={{ fontSize: "0.74rem" }}>Inteligente · Consultório Dra. Isabela</div>
+          </div>
+        </div>
+
+        <div className="gi-panel" style={{ borderRadius: 18, padding: "30px 26px", boxShadow: "0 24px 50px -18px rgba(31,41,55,0.18)" }}>
+          <h1 className="gi-text" style={{ fontSize: "1.3rem", fontWeight: 700, marginBottom: 4 }}>Entrar na plataforma</h1>
+          <p className="gi-text-soft" style={{ fontSize: "0.86rem", marginBottom: 22 }}>Acesse com seu usuário e selecione seu perfil.</p>
+
+          <form onSubmit={handleSubmit}>
+            <label className="gi-text-soft" style={fieldLabelStyle}>E-mail ou usuário</label>
+            <div style={inputWrap}>
+              <Mail size={16} className="gi-text-faint" style={{ position: "absolute", left: 12, top: "50%", transform: "translateY(-50%)" }} />
+              <input type="text" value={email} onChange={(e) => setEmail(e.target.value)} placeholder={role === "Administradora" ? "admin" : role === "Médica" ? "Dr. Isabela" : "voce@consultorioisabela.com.br"} className="gi-input" style={inputStyle} />
+            </div>
+
+            <label className="gi-text-soft" style={fieldLabelStyle}>Senha</label>
+            <div style={inputWrap}>
+              <Lock size={16} className="gi-text-faint" style={{ position: "absolute", left: 12, top: "50%", transform: "translateY(-50%)" }} />
+              <input type={showPw ? "text" : "password"} value={senha} onChange={(e) => setSenha(e.target.value)} placeholder="••••••••" className="gi-input" style={{ ...inputStyle, paddingRight: 38 }} />
+              <button type="button" onClick={() => setShowPw(!showPw)} className="gi-text-faint" style={{ position: "absolute", right: 10, top: "50%", transform: "translateY(-50%)", background: "none", border: "none", cursor: "pointer", display: "flex" }}>
+                {showPw ? <EyeOff size={16} /> : <Eye size={16} />}
+              </button>
+            </div>
+
+            <label className="gi-text-soft" style={fieldLabelStyle}>Perfil de acesso</label>
+            <div style={{ display: "flex", gap: 8, marginTop: 6, marginBottom: 8 }}>
+              {ROLES.map((r) => (
+                <button type="button" key={r} onClick={() => setRole(r)}
+                  className={r === role ? "gi-btn-primary" : "gi-btn-ghost"}
+                  style={{ flex: 1, padding: "9px 6px", borderRadius: 9, fontSize: "0.74rem", fontWeight: 600 }}>
+                  {r}
+                </button>
+              ))}
+            </div>
+
+            {error && (
+              <div style={{ display: "flex", gap: 8, alignItems: "center", color: "#dc2626", fontSize: "0.8rem", margin: "10px 0" }}>
+                <AlertTriangle size={14} /> {error}
+              </div>
+            )}
+
+            <button type="submit" className="gi-btn-primary" style={{ width: "100%", padding: 13, borderRadius: 10, fontSize: "0.95rem", marginTop: 14 }}>Entrar</button>
+          </form>
+        </div>
+        <p className="gi-text-faint" style={{ textAlign: "center", fontSize: "0.74rem", marginTop: 18 }}>
+          Protótipo de demonstração — dados salvos apenas neste navegador.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/* ============================= SHELL ============================= */
+
+function Shell({ theme, toggleTheme, active, setActive, role, onLogout, userEmail, children }) {
+  const activeItem = NAV_ITEMS.find((i) => i.key === active);
+
+  return (
+    <div className={`gi-root theme-${theme} gi-bg`} style={{ minHeight: "100vh", display: "flex" }}>
+      <ThemeStyles />
+      <aside className="gi-scroll" style={{ width: 252, flex: "none", background: "var(--sidebar-bg)", display: "flex", flexDirection: "column", padding: "20px 14px", position: "sticky", top: 0, height: "100vh", overflowY: "auto" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "4px 8px 22px" }}>
+          <div style={{ width: 38, height: 38, borderRadius: 10, flex: "none", background: "var(--primary)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+            <Stethoscope size={19} color="#fff" />
+          </div>
+          <div>
+            <div style={{ color: "#fff", fontSize: "0.96rem", fontWeight: 700, lineHeight: 1.1 }}>Gestão Ginecológica</div>
+            <div style={{ color: "rgba(255,255,255,0.5)", fontSize: "0.66rem", letterSpacing: "0.07em", textTransform: "uppercase" }}>Dra. Isabela</div>
+          </div>
+        </div>
+
+        <nav style={{ display: "flex", flexDirection: "column", gap: 2, flex: 1 }}>
+          {NAV_ITEMS.map((item) => {
+            const Icon = item.icon;
+            const isActive = item.key === active;
+            const restricted = item.restrict && ROLE_PERMISSIONS[role]?.[item.restrict] === "none";
+            const disabled = !item.ready;
+            return (
+              <button
+                key={item.key}
+                disabled={disabled}
+                onClick={() => { if (item.ready) setActive(item.key); }}
+                className={`gi-nav-item ${isActive ? "active" : ""} ${disabled ? "disabled" : ""}`}
+                style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 10px", borderRadius: 9, border: "none", background: "transparent", fontSize: "0.85rem", fontWeight: 500, textAlign: "left", cursor: item.ready ? "pointer" : "default" }}
+              >
+                <Icon size={16} style={{ flex: "none" }} />
+                <span style={{ flex: 1 }}>{item.label}</span>
+                {restricted && <ShieldCheck size={12} style={{ opacity: 0.7 }} />}
+                {!item.ready && <span style={{ fontSize: "0.6rem", padding: "2px 6px", borderRadius: 999, background: "rgba(255,255,255,0.1)" }}>em breve</span>}
+              </button>
+            );
+          })}
+        </nav>
+
+        <button onClick={onLogout} style={{ display: "flex", alignItems: "center", gap: 10, padding: 10, borderRadius: 9, border: "1px solid rgba(255,255,255,0.14)", background: "transparent", color: "rgba(255,255,255,0.75)", fontSize: "0.85rem", cursor: "pointer", marginTop: 10 }}>
+          <LogOut size={16} /> Sair
+        </button>
+      </aside>
+
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0 }}>
+        <header className="gi-panel" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "14px 22px", borderLeft: "none", borderTop: "none", borderRight: "none", position: "sticky", top: 0, zIndex: 10 }}>
+          <div>
+            <div className="gi-text" style={{ fontWeight: 700, fontSize: "1.02rem" }}>{activeItem?.label}</div>
+            <div className="gi-text-faint" style={{ fontSize: "0.76rem" }}>Perfil: {role}</div>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <span className="gi-badge-green" style={{ fontSize: "0.7rem", fontWeight: 700, padding: "5px 11px", borderRadius: 999 }}>Sistema médico</span>
+            <button className="gi-btn-ghost" style={{ width: 36, height: 36, borderRadius: 999, display: "flex", alignItems: "center", justifyContent: "center" }}><Bell size={16} /></button>
+            <button onClick={toggleTheme} className="gi-btn-ghost" style={{ width: 36, height: 36, borderRadius: 999, display: "flex", alignItems: "center", justifyContent: "center" }}>
+              {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
+            </button>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, paddingLeft: 8, borderLeft: "1px solid var(--border)" }}>
+              <div style={{ width: 32, height: 32, borderRadius: 999, background: "var(--primary)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                <CircleUserRound size={18} color="#fff" />
+              </div>
+              <div className="gi-text-soft" style={{ fontSize: "0.78rem", maxWidth: 130, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{userEmail}</div>
+            </div>
+          </div>
+        </header>
+        <main className="gi-scroll" style={{ flex: 1, overflowY: "auto", padding: 22 }}>{children}</main>
+      </div>
+    </div>
+  );
+}
+
+/* ============================= RESTRICTED VIEW ============================= */
+
+function RestrictedView({ moduleLabel }) {
+  return (
+    <div className="gi-fade-in gi-panel" style={{ borderRadius: 16, padding: 40, textAlign: "center", maxWidth: 440, margin: "60px auto" }}>
+      <ShieldCheck size={32} className="gi-primary" style={{ margin: "0 auto 14px" }} />
+      <div className="gi-text" style={{ fontWeight: 700, fontSize: "1rem", marginBottom: 6 }}>Acesso restrito</div>
+      <p className="gi-text-soft" style={{ fontSize: "0.86rem" }}>
+        {moduleLabel} contém informações clínicas sensíveis. Somente o perfil <strong>Médica</strong> pode acessar este módulo, conforme a política de segurança do consultório.
+      </p>
+    </div>
+  );
+}
+
+/* ============================= DASHBOARD ============================= */
+
+function QuickLinkCard({ icon: Icon, label, onClick, ready }) {
+  return (
+    <button onClick={onClick} disabled={!ready} className="gi-panel"
+      style={{ display: "flex", alignItems: "center", gap: 14, padding: "18px 18px", borderRadius: 14, textAlign: "left", cursor: ready ? "pointer" : "default", opacity: ready ? 1 : 0.55 }}>
+      <div style={{ width: 42, height: 42, borderRadius: 11, background: "rgba(61,90,115,0.1)", display: "flex", alignItems: "center", justifyContent: "center", flex: "none" }}>
+        <Icon size={19} className="gi-primary" />
+      </div>
+      <div>
+        <div className="gi-text" style={{ fontWeight: 700, fontSize: "0.92rem" }}>{label}</div>
+        {!ready && <div className="gi-text-faint" style={{ fontSize: "0.7rem" }}>Em breve</div>}
+      </div>
+    </button>
+  );
+}
+
+function IndicatorCard({ icon: Icon, label, value, sub }) {
+  return (
+    <div className="gi-panel gi-fade-in" style={{ borderRadius: 14, padding: "16px 18px" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+        <div className="gi-text-soft" style={{ fontSize: "0.76rem", fontWeight: 600 }}>{label}</div>
+        <div style={{ width: 30, height: 30, borderRadius: 9, background: "rgba(61,90,115,0.1)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <Icon size={15} className="gi-primary" />
+        </div>
+      </div>
+      <div className="gi-text" style={{ fontSize: "1.45rem", fontWeight: 800 }}>{value}</div>
+      {sub && <div className="gi-text-faint" style={{ fontSize: "0.72rem", marginTop: 2 }}>{sub}</div>}
+    </div>
+  );
+}
+
+function Dashboard({ patients, appointments, userEmail, role, setActive }) {
+  const today = toISODate(new Date());
+  const stats = useMemo(() => {
+    const todays = appointments.filter((a) => a.date === today && a.status !== "Cancelada").sort((a, b) => a.time.localeCompare(b.time));
+    const scheduled = appointments.filter((a) => a.date >= today && !["Cancelada", "Realizada"].includes(a.status));
+    const realized = appointments.filter((a) => a.status === "Realizada");
+    const cancelled = appointments.filter((a) => a.status === "Cancelada");
+    const faltas = appointments.filter((a) => a.status === "Faltou");
+    const retornosPendentes = appointments.filter((a) => a.type === "Consulta de retorno" && a.date >= today && a.status !== "Cancelada");
+    return { todays, scheduledCount: scheduled.length, realizedCount: realized.length, cancelledCount: cancelled.length, faltasCount: faltas.length, retornosCount: retornosPendentes.length };
+  }, [appointments, today]);
+
+  return (
+    <div className="gi-fade-in" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+      <div className="gi-panel" style={{ borderRadius: 16, padding: "22px 24px", background: "var(--primary)", border: "none" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6 }}>
+          <CalendarClock size={18} color="#fff" />
+          <span style={{ color: "#fff", fontWeight: 800, fontSize: "0.98rem", letterSpacing: "0.02em" }}>MINHA AGENDA DE HOJE</span>
+        </div>
+        <p style={{ color: "rgba(255,255,255,0.82)", fontSize: "0.88rem", margin: "0 0 10px" }}>
+          {stats.todays.length === 0 ? "Nenhuma consulta agendada para hoje." : `${stats.todays.length} consulta(s) hoje — ${stats.todays[0].time} ${stats.todays[0].patientName}${stats.todays.length > 1 ? `, próxima: ${stats.todays[1]?.time} ${stats.todays[1]?.patientName}` : ""}.`}
+        </p>
+        <span className="gi-badge-green" style={{ fontSize: "0.72rem", fontWeight: 700, padding: "5px 12px", borderRadius: 999 }}>Perfil: {role}</span>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: 14 }}>
+        <IndicatorCard icon={Users} label="Total de pacientes" value={patients.length} />
+        <IndicatorCard icon={CalendarDays} label="Consultas agendadas" value={stats.scheduledCount} />
+        <IndicatorCard icon={CheckCircle2} label="Consultas realizadas" value={stats.realizedCount} />
+        <IndicatorCard icon={XCircle} label="Cancelamentos" value={stats.cancelledCount} />
+        <IndicatorCard icon={AlertTriangle} label="Faltas" value={stats.faltasCount} />
+        <IndicatorCard icon={TrendingUp} label="Retornos pendentes" value={stats.retornosCount} />
+        <IndicatorCard icon={FlaskConical} label="Exames pendentes" value="—" sub="Módulo em breve" />
+        <IndicatorCard icon={Wallet} label="Pagamentos pendentes" value="—" sub="Módulo Financeiro em breve" />
+      </div>
+
+      <div>
+        <div className="gi-text" style={{ fontWeight: 700, fontSize: "0.95rem", marginBottom: 12 }}>Acesso rápido</div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 12 }}>
+          <QuickLinkCard icon={CalendarDays} label="Agenda" ready onClick={() => setActive("agenda")} />
+          <QuickLinkCard icon={Users} label="Pacientes" ready onClick={() => setActive("pacientes")} />
+          <QuickLinkCard icon={Stethoscope} label="Prontuário" ready onClick={() => setActive("prontuarios")} />
+          <QuickLinkCard icon={FlaskConical} label="Exames" ready={false} />
+          <QuickLinkCard icon={Wallet} label="Financeiro" ready={false} />
+          <QuickLinkCard icon={BarChart3} label="Relatórios" ready={false} />
+        </div>
+      </div>
+
+      <div className="gi-panel" style={{ borderRadius: 16, padding: 20 }}>
+        <div className="gi-text" style={{ fontWeight: 700, fontSize: "0.95rem", marginBottom: 14 }}>Consultas de hoje</div>
+        {stats.todays.length === 0 && <div className="gi-text-faint" style={{ fontSize: "0.84rem" }}>Nenhuma consulta para hoje.</div>}
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {stats.todays.map((a) => {
+            const st = STATUS_STYLE[a.status];
+            return (
+              <div key={a.id} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <div style={{ width: 6, height: 6, borderRadius: 999, background: st.dot, flex: "none" }} />
+                <div style={{ flex: 1 }}>
+                  <div className="gi-text" style={{ fontSize: "0.84rem", fontWeight: 600 }}>{a.time} · {a.patientName}</div>
+                  <div className="gi-text-faint" style={{ fontSize: "0.74rem" }}>{a.type}</div>
+                </div>
+                <span style={{ background: st.bg, color: st.fg, fontSize: "0.7rem", fontWeight: 700, padding: "3px 9px", borderRadius: 999 }}>{a.status}</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================= APPOINTMENT MODAL + AGENDA ============================= */
+
+function AppointmentModal({ initial, patients, appointments, onSave, onClose, onQuickAddPatient }) {
+  const isEdit = !!initial?.id;
+  const [form, setForm] = useState(() => initial || { patientId: patients[0]?.id || "", date: toISODate(new Date()), time: "09:00", type: APPT_TYPES[0], duration: 30, status: "Agendado", notes: "" });
+  const [newPatientName, setNewPatientName] = useState("");
+  const [showNewPatient, setShowNewPatient] = useState(false);
+
+  const conflict = useMemo(() => appointments.find((a) => a.id !== form.id && a.date === form.date && a.status !== "Cancelada" && overlaps(a.time, a.duration, form.time, Number(form.duration))), [appointments, form]);
+
+  function update(field, value) { setForm((f) => ({ ...f, [field]: value })); }
+  function handleSubmit(e) {
+    e.preventDefault();
+    if (conflict) return;
+    const patient = patients.find((p) => p.id === form.patientId);
+    onSave({ ...form, id: form.id || `a${Date.now()}`, patientName: patient?.name || form.patientName, duration: Number(form.duration) });
+  }
+  function handleAddPatient() {
+    if (!newPatientName.trim()) return;
+    const p = onQuickAddPatient(newPatientName.trim());
+    update("patientId", p.id);
+    setNewPatientName(""); setShowNewPatient(false);
+  }
+
+  const fieldLabelStyle = { fontSize: "0.72rem", fontWeight: 600, letterSpacing: "0.03em", textTransform: "uppercase" };
+  const inputStyle = { width: "100%", padding: "10px 11px", borderRadius: 9, fontSize: "0.86rem", marginTop: 5 };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", zIndex: 50, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
+      <div className="gi-panel gi-fade-in gi-scroll" style={{ width: "100%", maxWidth: 460, borderRadius: 18, padding: 22, maxHeight: "92vh", overflowY: "auto" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 18 }}>
+          <div className="gi-text" style={{ fontSize: "1.05rem", fontWeight: 700 }}>{isEdit ? "Editar agendamento" : "Novo agendamento"}</div>
+          <button onClick={onClose} className="gi-btn-ghost" style={{ width: 30, height: 30, borderRadius: 999, display: "flex", alignItems: "center", justifyContent: "center" }}><X size={15} /></button>
+        </div>
+        <form onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <div>
+            <label className="gi-text-soft" style={fieldLabelStyle}>Paciente</label>
+            {!showNewPatient ? (
+              <div style={{ display: "flex", gap: 8, marginTop: 5 }}>
+                <select className="gi-input" style={{ ...inputStyle, margin: 0, flex: 1 }} value={form.patientId} onChange={(e) => update("patientId", e.target.value)}>
+                  {patients.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                </select>
+                <button type="button" onClick={() => setShowNewPatient(true)} className="gi-btn-ghost" style={{ padding: "0 12px", borderRadius: 9, fontSize: "0.78rem", whiteSpace: "nowrap" }}>+ Novo</button>
+              </div>
+            ) : (
+              <div style={{ display: "flex", gap: 8, marginTop: 5 }}>
+                <input className="gi-input" style={{ ...inputStyle, margin: 0, flex: 1 }} placeholder="Nome da nova paciente" value={newPatientName} onChange={(e) => setNewPatientName(e.target.value)} />
+                <button type="button" onClick={handleAddPatient} className="gi-btn-primary" style={{ padding: "0 14px", borderRadius: 9, fontSize: "0.78rem" }}>Adicionar</button>
+              </div>
+            )}
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <div><label className="gi-text-soft" style={fieldLabelStyle}>Data</label><input type="date" className="gi-input" style={inputStyle} value={form.date} onChange={(e) => update("date", e.target.value)} /></div>
+            <div><label className="gi-text-soft" style={fieldLabelStyle}>Horário</label><input type="time" className="gi-input" style={inputStyle} value={form.time} onChange={(e) => update("time", e.target.value)} /></div>
+          </div>
+          <div>
+            <label className="gi-text-soft" style={fieldLabelStyle}>Tipo de atendimento</label>
+            <select className="gi-input" style={inputStyle} value={form.type} onChange={(e) => update("type", e.target.value)}>{APPT_TYPES.map((t) => <option key={t} value={t}>{t}</option>)}</select>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <div><label className="gi-text-soft" style={fieldLabelStyle}>Duração</label><select className="gi-input" style={inputStyle} value={form.duration} onChange={(e) => update("duration", e.target.value)}>{DURATIONS.map((d) => <option key={d} value={d}>{d} min</option>)}</select></div>
+            <div><label className="gi-text-soft" style={fieldLabelStyle}>Status</label><select className="gi-input" style={inputStyle} value={form.status} onChange={(e) => update("status", e.target.value)}>{STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}</select></div>
+          </div>
+          <div><label className="gi-text-soft" style={fieldLabelStyle}>Observações</label><textarea className="gi-input" style={{ ...inputStyle, resize: "vertical", minHeight: 56 }} value={form.notes} onChange={(e) => update("notes", e.target.value)} /></div>
+
+          {conflict && (
+            <div style={{ display: "flex", gap: 8, alignItems: "flex-start", padding: "10px 12px", borderRadius: 10, background: "rgba(220,38,38,0.1)", color: "#dc2626", fontSize: "0.8rem" }}>
+              <AlertTriangle size={15} style={{ flex: "none", marginTop: 1 }} />
+              <span>Conflito de horário: já existe consulta das {conflict.time} com {conflict.patientName} nesse intervalo.</span>
+            </div>
+          )}
+
+          <div style={{ display: "flex", gap: 10, marginTop: 4 }}>
+            <button type="button" onClick={onClose} className="gi-btn-ghost" style={{ flex: 1, padding: 11, borderRadius: 10, fontSize: "0.86rem" }}>Cancelar</button>
+            <button type="submit" disabled={!!conflict} className="gi-btn-primary" style={{ flex: 2, padding: 11, borderRadius: 10, fontSize: "0.86rem" }}>{isEdit ? "Salvar alterações" : "Criar agendamento"}</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+function AppointmentChip({ a, onClick }) {
+  const st = STATUS_STYLE[a.status];
+  return (
+    <button onClick={onClick} style={{ width: "100%", textAlign: "left", border: "none", cursor: "pointer", background: st.bg, color: st.fg, borderRadius: 9, padding: "8px 10px", display: "flex", flexDirection: "column", gap: 2 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "0.76rem", fontWeight: 700 }}><Clock size={11} /> {a.time} <span style={{ opacity: 0.6, fontWeight: 500 }}>· {a.duration}min</span></div>
+      <div style={{ fontSize: "0.82rem", fontWeight: 700 }}>{a.patientName}</div>
+      <div style={{ fontSize: "0.72rem", opacity: 0.85 }}>{a.type}</div>
+    </button>
+  );
+}
+
+function DayColumn({ date, appointments, onOpen, compact }) {
+  const dayAppts = appointments.filter((a) => a.date === date).sort((a, b) => a.time.localeCompare(b.time));
+  const d = new Date(date + "T00:00:00");
+  const isToday = date === toISODate(new Date());
+  return (
+    <div className="gi-panel" style={{ borderRadius: 12, padding: 10, minHeight: compact ? 120 : 200, display: "flex", flexDirection: "column", gap: 8 }}>
+      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between" }}>
+        <div className="gi-text-soft" style={{ fontSize: "0.68rem", fontWeight: 700, textTransform: "uppercase" }}>{WEEKDAY_LABELS[d.getDay()]}</div>
+        <div className={isToday ? "gi-primary" : "gi-text"} style={{ fontSize: "0.92rem", fontWeight: isToday ? 800 : 600 }}>{d.getDate()}</div>
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+        {dayAppts.length === 0 && <div className="gi-text-faint" style={{ fontSize: "0.7rem" }}>Sem agendamentos</div>}
+        {dayAppts.map((a) => <AppointmentChip key={a.id} a={a} onClick={() => onOpen(a)} />)}
+      </div>
+    </div>
+  );
+}
+
+function Agenda({ patients, appointments, setAppointments, quickAddPatient }) {
+  const [view, setView] = useState("Dia");
+  const [refDate, setRefDate] = useState(toISODate(new Date()));
+  const [modalOpen, setModalOpen] = useState(false);
+  const [editing, setEditing] = useState(null);
+
+  function openNew() { setEditing(null); setModalOpen(true); }
+  function openEdit(a) { setEditing(a); setModalOpen(true); }
+  function handleSave(appt) {
+    setAppointments((prev) => prev.some((a) => a.id === appt.id) ? prev.map((a) => a.id === appt.id ? appt : a) : [...prev, appt]);
+    setModalOpen(false);
+  }
+  function shift(delta) {
+    if (view === "Dia") setRefDate(addDays(refDate, delta));
+    else if (view === "Semana") setRefDate(addDays(refDate, delta * 7));
+    else { const d = new Date(refDate + "T00:00:00"); d.setMonth(d.getMonth() + delta); setRefDate(toISODate(d)); }
+  }
+  const weekDates = useMemo(() => { const start = startOfWeek(refDate); return [...Array(7)].map((_, i) => addDays(start, i)); }, [refDate]);
+  const monthGrid = useMemo(() => {
+    const d = new Date(refDate + "T00:00:00"); const year = d.getFullYear(), month = d.getMonth();
+    const start = toISODate(new Date(year, month, 1));
+    const startWeek = startOfWeek(start);
+    return { cells: [...Array(42)].map((_, i) => addDays(startWeek, i)), year, month };
+  }, [refDate]);
+
+  return (
+    <div className="gi-fade-in" style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <button onClick={() => shift(-1)} className="gi-btn-ghost" style={{ width: 34, height: 34, borderRadius: 9, display: "flex", alignItems: "center", justifyContent: "center" }}><ChevronLeft size={16} /></button>
+          <button onClick={() => setRefDate(toISODate(new Date()))} className="gi-btn-ghost" style={{ padding: "8px 14px", borderRadius: 9, fontSize: "0.8rem", fontWeight: 600 }}>Hoje</button>
+          <button onClick={() => shift(1)} className="gi-btn-ghost" style={{ width: 34, height: 34, borderRadius: 9, display: "flex", alignItems: "center", justifyContent: "center" }}><ChevronRight size={16} /></button>
+          <div className="gi-text" style={{ fontWeight: 700, fontSize: "1rem", marginLeft: 6 }}>{view === "Mês" ? `${MONTH_LABELS[monthGrid.month]} ${monthGrid.year}` : fmtDateLong(refDate)}</div>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div className="gi-panel-2" style={{ display: "flex", borderRadius: 9, padding: 3, gap: 2 }}>
+            {["Dia", "Semana", "Mês"].map((v) => (
+              <button key={v} onClick={() => setView(v)} className={v === view ? "gi-btn-primary" : ""} style={{ padding: "6px 14px", borderRadius: 7, fontSize: "0.78rem", fontWeight: 600, border: "none", cursor: "pointer", background: v === view ? undefined : "transparent", color: v === view ? undefined : "var(--text-soft)" }}>{v}</button>
+            ))}
+          </div>
+          <button onClick={openNew} className="gi-btn-primary" style={{ display: "flex", alignItems: "center", gap: 6, padding: "9px 16px", borderRadius: 9, fontSize: "0.82rem" }}><Plus size={15} /> Novo agendamento</button>
+        </div>
+      </div>
+
+      {view === "Dia" && <div style={{ maxWidth: 420 }}><DayColumn date={refDate} appointments={appointments} onOpen={openEdit} /></div>}
+      {view === "Semana" && <div style={{ display: "grid", gridTemplateColumns: "repeat(7, minmax(130px, 1fr))", gap: 10, overflowX: "auto" }}>{weekDates.map((d) => <DayColumn key={d} date={d} appointments={appointments} onOpen={openEdit} />)}</div>}
+      {view === "Mês" && (
+        <div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(7,1fr)", gap: 6, marginBottom: 6 }}>{WEEKDAY_LABELS.map((w) => <div key={w} className="gi-text-faint" style={{ textAlign: "center", fontSize: "0.7rem", fontWeight: 700 }}>{w}</div>)}</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(7,1fr)", gap: 6 }}>
+            {monthGrid.cells.map((date) => {
+              const inMonth = isSameMonth(date, monthGrid.year, monthGrid.month);
+              const dayAppts = appointments.filter((a) => a.date === date);
+              const isToday = date === toISODate(new Date());
+              const d = new Date(date + "T00:00:00");
+              return (
+                <button key={date} onClick={() => { setRefDate(date); setView("Dia"); }} className="gi-panel" style={{ borderRadius: 10, padding: 8, minHeight: 62, textAlign: "left", cursor: "pointer", opacity: inMonth ? 1 : 0.35, display: "flex", flexDirection: "column", gap: 6 }}>
+                  <div className={isToday ? "gi-primary" : "gi-text"} style={{ fontSize: "0.78rem", fontWeight: isToday ? 800 : 600 }}>{d.getDate()}</div>
+                  {dayAppts.length > 0 && <div style={{ display: "flex", gap: 3, flexWrap: "wrap" }}>{dayAppts.slice(0, 4).map((a) => <div key={a.id} style={{ width: 6, height: 6, borderRadius: 999, background: STATUS_STYLE[a.status].dot }} />)}</div>}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {modalOpen && <AppointmentModal initial={editing} patients={patients} appointments={appointments} onSave={handleSave} onClose={() => setModalOpen(false)} onQuickAddPatient={quickAddPatient} />}
+    </div>
+  );
+}
+
+/* ============================= PATIENTS ============================= */
+
+function PatientFormModal({ initial, onSave, onClose }) {
+  const isEdit = !!initial?.id;
+  const [form, setForm] = useState(() => initial || { name: "", cpf: "", birthDate: "", phone: "", whatsapp: "", email: "", address: "", emergencyContact: "", alergias: "", medicamentos: "", antecedentesFamiliares: "", archived: false });
+  function update(field, value) { setForm((f) => ({ ...f, [field]: value })); }
+  function handleSubmit(e) { e.preventDefault(); if (!form.name.trim()) return; onSave({ ...form, id: form.id || `pt${Date.now()}` }); }
+  const fieldLabelStyle = { fontSize: "0.72rem", fontWeight: 600, letterSpacing: "0.03em", textTransform: "uppercase" };
+  const inputStyle = { width: "100%", padding: "10px 11px", borderRadius: 9, fontSize: "0.86rem", marginTop: 5 };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", zIndex: 50, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
+      <div className="gi-panel gi-fade-in gi-scroll" style={{ width: "100%", maxWidth: 480, borderRadius: 18, padding: 22, maxHeight: "92vh", overflowY: "auto" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 18 }}>
+          <div className="gi-text" style={{ fontSize: "1.05rem", fontWeight: 700 }}>{isEdit ? "Editar paciente" : "Nova paciente"}</div>
+          <button onClick={onClose} className="gi-btn-ghost" style={{ width: 30, height: 30, borderRadius: 999, display: "flex", alignItems: "center", justifyContent: "center" }}><X size={15} /></button>
+        </div>
+        <form onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          <div><label className="gi-text-soft" style={fieldLabelStyle}>Nome completo</label><input className="gi-input" style={inputStyle} value={form.name} onChange={(e) => update("name", e.target.value)} required /></div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <div><label className="gi-text-soft" style={fieldLabelStyle}>CPF</label><input className="gi-input" style={inputStyle} value={form.cpf} onChange={(e) => update("cpf", e.target.value)} placeholder="000.000.000-00" /></div>
+            <div><label className="gi-text-soft" style={fieldLabelStyle}>Data de nascimento</label><input type="date" className="gi-input" style={inputStyle} value={form.birthDate} onChange={(e) => update("birthDate", e.target.value)} /></div>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <div><label className="gi-text-soft" style={fieldLabelStyle}>Telefone</label><input className="gi-input" style={inputStyle} value={form.phone} onChange={(e) => update("phone", e.target.value)} /></div>
+            <div><label className="gi-text-soft" style={fieldLabelStyle}>WhatsApp</label><input className="gi-input" style={inputStyle} value={form.whatsapp} onChange={(e) => update("whatsapp", e.target.value)} /></div>
+          </div>
+          <div><label className="gi-text-soft" style={fieldLabelStyle}>E-mail</label><input type="email" className="gi-input" style={inputStyle} value={form.email} onChange={(e) => update("email", e.target.value)} /></div>
+          <div><label className="gi-text-soft" style={fieldLabelStyle}>Endereço</label><input className="gi-input" style={inputStyle} value={form.address} onChange={(e) => update("address", e.target.value)} /></div>
+          <div><label className="gi-text-soft" style={fieldLabelStyle}>Contato de emergência</label><input className="gi-input" style={inputStyle} value={form.emergencyContact} onChange={(e) => update("emergencyContact", e.target.value)} placeholder="Nome — telefone" /></div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <div><label className="gi-text-soft" style={fieldLabelStyle}>Alergias</label><input className="gi-input" style={inputStyle} value={form.alergias} onChange={(e) => update("alergias", e.target.value)} placeholder="Nenhuma conhecida" /></div>
+            <div><label className="gi-text-soft" style={fieldLabelStyle}>Medicamentos em uso</label><input className="gi-input" style={inputStyle} value={form.medicamentos} onChange={(e) => update("medicamentos", e.target.value)} /></div>
+          </div>
+          <div><label className="gi-text-soft" style={fieldLabelStyle}>Antecedentes familiares</label><textarea className="gi-input" style={{ ...inputStyle, resize: "vertical", minHeight: 56 }} value={form.antecedentesFamiliares} onChange={(e) => update("antecedentesFamiliares", e.target.value)} /></div>
+          <div style={{ display: "flex", gap: 10, marginTop: 4 }}>
+            <button type="button" onClick={onClose} className="gi-btn-ghost" style={{ flex: 1, padding: 11, borderRadius: 10, fontSize: "0.86rem" }}>Cancelar</button>
+            <button type="submit" className="gi-btn-primary" style={{ flex: 2, padding: 11, borderRadius: 10, fontSize: "0.86rem" }}>{isEdit ? "Salvar alterações" : "Cadastrar paciente"}</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+function InfoRow({ icon: Icon, label, value }) {
+  return (
+    <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
+      <Icon size={14} className="gi-text-faint" style={{ marginTop: 2, flex: "none" }} />
+      <div>
+        <div className="gi-text-faint" style={{ fontSize: "0.68rem", textTransform: "uppercase", letterSpacing: "0.04em" }}>{label}</div>
+        <div className="gi-text" style={{ fontSize: "0.86rem", fontWeight: 500 }}>{value || "—"}</div>
+      </div>
+    </div>
+  );
+}
+
+function SmartSummaryCard({ patient, records }) {
+  const summary = useMemo(() => buildSmartSummary(patient, records), [patient, records]);
+  if (!summary) return null;
+  return (
+    <div className="gi-panel" style={{ borderRadius: 14, padding: 18, marginBottom: 16, borderLeft: "3px solid var(--primary)" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+        <Sparkles size={15} className="gi-primary" />
+        <span className="gi-text" style={{ fontWeight: 700, fontSize: "0.86rem" }}>Resumo inteligente (automático)</span>
+      </div>
+      <p className="gi-text-soft" style={{ fontSize: "0.84rem", lineHeight: 1.5 }}>{summary.text}</p>
+      {summary.missing.length > 0 && (
+        <div style={{ marginTop: 10, display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {summary.missing.map((m) => (
+            <span key={m} style={{ fontSize: "0.68rem", fontWeight: 600, background: "rgba(217,119,6,0.12)", color: "#B45309", padding: "3px 9px", borderRadius: 999 }}>Pendente: {m}</span>
+          ))}
+        </div>
+      )}
+      <p className="gi-text-faint" style={{ fontSize: "0.68rem", marginTop: 10 }}>Gerado automaticamente a partir dos dados cadastrados — revisão médica obrigatória.</p>
+    </div>
+  );
+}
+
+const PROFILE_TABS = ["Dados", "Consultas", "Prontuário"];
+
+function PatientProfile({ patient, appointments, records, canSeeProntuario, onBack, onEdit, onArchive, onOpenRecord }) {
+  const [tab, setTab] = useState("Dados");
+  const patientAppts = appointments.filter((a) => a.patientId === patient.id).sort((a, b) => (b.date + b.time).localeCompare(a.date + a.time));
+  const patientRecords = records.filter((r) => r.patientId === patient.id).sort((a, b) => b.date.localeCompare(a.date));
+
+  return (
+    <div className="gi-fade-in">
+      <button onClick={onBack} className="gi-btn-ghost" style={{ display: "flex", alignItems: "center", gap: 6, padding: "7px 12px", borderRadius: 8, fontSize: "0.78rem", marginBottom: 14 }}><ArrowLeft size={14} /> Voltar para pacientes</button>
+
+      <div className="gi-panel" style={{ borderRadius: 16, padding: 20, display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 16, marginBottom: 16 }}>
+        <div style={{ display: "flex", gap: 14, alignItems: "center" }}>
+          <div style={{ width: 52, height: 52, borderRadius: 999, background: "var(--primary)", display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontWeight: 800, fontSize: "1.1rem" }}>
+            {patient.name.split(" ").map((n) => n[0]).slice(0, 2).join("")}
+          </div>
+          <div>
+            <div className="gi-text" style={{ fontSize: "1.1rem", fontWeight: 700 }}>{patient.name}</div>
+            <div className="gi-text-faint" style={{ fontSize: "0.78rem" }}>{calcAge(patient.birthDate) != null ? `${calcAge(patient.birthDate)} anos · ` : ""}{patient.phone}</div>
+          </div>
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={() => onEdit(patient)} className="gi-btn-ghost" style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 14px", borderRadius: 9, fontSize: "0.78rem" }}><Pencil size={13} /> Editar</button>
+          <button onClick={() => onArchive(patient)} className="gi-btn-ghost" style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 14px", borderRadius: 9, fontSize: "0.78rem" }}><Archive size={13} /> {patient.archived ? "Reativar" : "Arquivar"}</button>
+        </div>
+      </div>
+
+      <div className="gi-panel-2" style={{ display: "inline-flex", borderRadius: 9, padding: 3, gap: 2, marginBottom: 16 }}>
+        {PROFILE_TABS.map((t) => (
+          <button key={t} onClick={() => setTab(t)} className={t === tab ? "gi-btn-primary" : ""} style={{ padding: "7px 14px", borderRadius: 7, fontSize: "0.78rem", fontWeight: 600, border: "none", cursor: "pointer", background: t === tab ? undefined : "transparent", color: t === tab ? undefined : "var(--text-soft)" }}>{t}</button>
+        ))}
+      </div>
+
+      {tab === "Dados" && (
+        <div className="gi-panel" style={{ borderRadius: 16, padding: 20, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 18 }}>
+          <InfoRow icon={CalendarDays} label="Data de nascimento" value={patient.birthDate ? fmtDateLong(patient.birthDate) : "—"} />
+          <InfoRow icon={Phone} label="Telefone / WhatsApp" value={patient.phone} />
+          <InfoRow icon={Mail} label="E-mail" value={patient.email} />
+          <InfoRow icon={Home} label="Endereço" value={patient.address} />
+          <InfoRow icon={HeartPulse} label="Contato de emergência" value={patient.emergencyContact} />
+          <InfoRow icon={AlertTriangle} label="Alergias" value={patient.alergias} />
+          <InfoRow icon={ClipboardList} label="Medicamentos em uso" value={patient.medicamentos} />
+          <InfoRow icon={Users} label="Antecedentes familiares" value={patient.antecedentesFamiliares} />
+        </div>
+      )}
+
+      {tab === "Consultas" && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {patientAppts.length === 0 && <div className="gi-text-faint" style={{ fontSize: "0.84rem" }}>Nenhuma consulta registrada.</div>}
+          {patientAppts.map((a) => {
+            const st = STATUS_STYLE[a.status];
+            return (
+              <div key={a.id} className="gi-panel" style={{ borderRadius: 12, padding: "12px 16px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+                <div>
+                  <div className="gi-text" style={{ fontWeight: 600, fontSize: "0.86rem" }}>{fmtDateLong(a.date)} · {a.time}</div>
+                  <div className="gi-text-faint" style={{ fontSize: "0.76rem" }}>{a.type}</div>
+                </div>
+                <span style={{ background: st.bg, color: st.fg, fontSize: "0.72rem", fontWeight: 700, padding: "4px 10px", borderRadius: 999 }}>{a.status}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {tab === "Prontuário" && (
+        canSeeProntuario ? (
+          <div>
+            <SmartSummaryCard patient={patient} records={patientRecords} />
+            <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 10 }}>
+              <button onClick={() => onOpenRecord(null, patient.id)} className="gi-btn-primary" style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 14px", borderRadius: 9, fontSize: "0.78rem" }}><FilePlus size={14} /> Novo registro</button>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {patientRecords.length === 0 && <div className="gi-text-faint" style={{ fontSize: "0.84rem" }}>Nenhum registro de prontuário.</div>}
+              {patientRecords.map((r) => (
+                <button key={r.id} onClick={() => onOpenRecord(r)} className="gi-panel" style={{ textAlign: "left", cursor: "pointer", borderRadius: 12, padding: 16 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+                    <div className="gi-text" style={{ fontWeight: 700, fontSize: "0.86rem" }}>{fmtDateLong(r.date)}</div>
+                    <div className="gi-text-faint" style={{ fontSize: "0.76rem" }}>{r.professional}</div>
+                  </div>
+                  <div className="gi-text-soft" style={{ fontSize: "0.82rem" }}><strong>Queixa:</strong> {r.queixaPrincipal || "—"}</div>
+                  <div className="gi-text-soft" style={{ fontSize: "0.82rem" }}><strong>Diagnóstico:</strong> {r.diagnosticos || "—"}</div>
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : <RestrictedView moduleLabel="O Prontuário" />
+      )}
+    </div>
+  );
+}
+
+function PatientsPage({ patients, appointments, records, role, onSave, onArchive, onOpenRecord }) {
+  const [query, setQuery] = useState("");
+  const [selectedId, setSelectedId] = useState(null);
+  const [modalOpen, setModalOpen] = useState(false);
+  const [editing, setEditing] = useState(null);
+  const [showArchived, setShowArchived] = useState(false);
+  const canSeeProntuario = ROLE_PERMISSIONS[role]?.prontuario !== "none";
+
+  const filtered = patients.filter((p) => {
+    if (p.archived && !showArchived) return false;
+    const q = query.trim().toLowerCase();
+    if (!q) return true;
+    return p.name.toLowerCase().includes(q) || (p.phone || "").includes(q) || (p.cpf || "").includes(q);
+  });
+  const selected = patients.find((p) => p.id === selectedId);
+
+  if (selected) {
+    return (
+      <PatientProfile
+        patient={selected} appointments={appointments} records={records} canSeeProntuario={canSeeProntuario}
+        onBack={() => setSelectedId(null)} onEdit={(p) => { setEditing(p); setModalOpen(true); }} onArchive={onArchive}
+        onOpenRecord={(r, patientId) => onOpenRecord(r, patientId || selected.id)}
+      />
+    );
+  }
+
+  return (
+    <div className="gi-fade-in" style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 12 }}>
+        <div style={{ position: "relative", flex: 1, minWidth: 220, maxWidth: 340 }}>
+          <Search size={15} className="gi-text-faint" style={{ position: "absolute", left: 12, top: "50%", transform: "translateY(-50%)" }} />
+          <input className="gi-input" placeholder="Pesquisar por nome, telefone ou CPF..." value={query} onChange={(e) => setQuery(e.target.value)} style={{ width: "100%", padding: "9px 12px 9px 34px", borderRadius: 9, fontSize: "0.84rem" }} />
+        </div>
+        <div style={{ display: "flex", gap: 10 }}>
+          <label className="gi-text-soft" style={{ display: "flex", alignItems: "center", gap: 6, fontSize: "0.78rem", cursor: "pointer" }}><input type="checkbox" checked={showArchived} onChange={(e) => setShowArchived(e.target.checked)} /> Mostrar arquivadas</label>
+          <button onClick={() => { setEditing(null); setModalOpen(true); }} className="gi-btn-primary" style={{ display: "flex", alignItems: "center", gap: 6, padding: "9px 16px", borderRadius: 9, fontSize: "0.82rem" }}><Plus size={15} /> Nova paciente</button>
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))", gap: 12 }}>
+        {filtered.length === 0 && <div className="gi-text-faint" style={{ fontSize: "0.84rem" }}>Nenhuma paciente encontrada.</div>}
+        {filtered.map((p) => (
+          <button key={p.id} onClick={() => setSelectedId(p.id)} className="gi-panel" style={{ textAlign: "left", cursor: "pointer", borderRadius: 14, padding: 16, display: "flex", gap: 12, alignItems: "center" }}>
+            <div style={{ width: 40, height: 40, borderRadius: 999, flex: "none", background: "var(--primary)", display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontWeight: 800, fontSize: "0.86rem" }}>
+              {p.name.split(" ").map((n) => n[0]).slice(0, 2).join("")}
+            </div>
+            <div style={{ minWidth: 0 }}>
+              <div className="gi-text" style={{ fontWeight: 700, fontSize: "0.88rem", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}{p.archived ? " (arquivada)" : ""}</div>
+              <div className="gi-text-faint" style={{ fontSize: "0.74rem" }}>{p.phone || "Sem telefone"}</div>
+            </div>
+          </button>
+        ))}
+      </div>
+
+      {modalOpen && <PatientFormModal initial={editing} onSave={(p) => { onSave(p); setModalOpen(false); }} onClose={() => setModalOpen(false)} />}
+    </div>
+  );
+}
+
+/* ============================= PRONTUÁRIO (STANDALONE PAGE) ============================= */
+
+function RecordModal({ initial, defaultPatientId, patients, onSave, onClose }) {
+  const isEdit = !!initial?.id;
+  const [form, setForm] = useState(() => initial || {
+    patientId: defaultPatientId || patients[0]?.id || "", date: toISODate(new Date()), professional: "Dra. Isabela",
+    queixaPrincipal: "", sintomas: "", dum: "", cicloMenstrual: "",
+    gestacoes: 0, partos: 0, abortos: 0, historicoContraceptivo: "", historicoSexual: "",
+    antecedentesPessoais: "", alergias: "", medicamentos: "",
+    exameFisico: "", sinaisVitais: "", diagnosticos: "", evolucaoClinica: "", condutaMedica: "",
+    historicoProcedimentos: "", observacoes: "",
+  });
+  function update(field, value) { setForm((f) => ({ ...f, [field]: value })); }
+  function handleSubmit(e) {
+    e.preventDefault();
+    const patient = patients.find((p) => p.id === form.patientId);
+    onSave({ ...form, id: form.id || `r${Date.now()}`, patientName: patient?.name || form.patientName, gestacoes: Number(form.gestacoes) || 0, partos: Number(form.partos) || 0, abortos: Number(form.abortos) || 0 });
+  }
+  const fieldLabelStyle = { fontSize: "0.72rem", fontWeight: 600, letterSpacing: "0.03em", textTransform: "uppercase" };
+  const inputStyle = { width: "100%", padding: "10px 11px", borderRadius: 9, fontSize: "0.86rem", marginTop: 5 };
+  const taStyle = { ...inputStyle, resize: "vertical", minHeight: 50 };
+  const sectionTitle = { fontSize: "0.76rem", fontWeight: 800, textTransform: "uppercase", letterSpacing: "0.04em", margin: "6px 0 -2px", display: "flex", alignItems: "center", gap: 6 };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.5)", zIndex: 50, display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }}>
+      <div className="gi-panel gi-fade-in gi-scroll" style={{ width: "100%", maxWidth: 600, borderRadius: 18, padding: 22, maxHeight: "92vh", overflowY: "auto" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 18 }}>
+          <div className="gi-text" style={{ fontSize: "1.05rem", fontWeight: 700 }}>{isEdit ? "Editar registro" : "Novo registro de prontuário"}</div>
+          <button onClick={onClose} className="gi-btn-ghost" style={{ width: 30, height: 30, borderRadius: 999, display: "flex", alignItems: "center", justifyContent: "center" }}><X size={15} /></button>
+        </div>
+        <form onSubmit={handleSubmit} style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "1.4fr 1fr", gap: 12 }}>
+            <div><label className="gi-text-soft" style={fieldLabelStyle}>Paciente</label><select className="gi-input" style={inputStyle} value={form.patientId} onChange={(e) => update("patientId", e.target.value)}>{patients.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}</select></div>
+            <div><label className="gi-text-soft" style={fieldLabelStyle}>Data do atendimento</label><input type="date" className="gi-input" style={inputStyle} value={form.date} onChange={(e) => update("date", e.target.value)} /></div>
+          </div>
+
+          <div className="gi-primary" style={sectionTitle}><ClipboardList size={13} /> Anamnese ginecológica</div>
+          <div><label className="gi-text-soft" style={fieldLabelStyle}>Queixa principal</label><textarea className="gi-input" style={taStyle} value={form.queixaPrincipal} onChange={(e) => update("queixaPrincipal", e.target.value)} /></div>
+          <div><label className="gi-text-soft" style={fieldLabelStyle}>Sintomas</label><textarea className="gi-input" style={taStyle} value={form.sintomas} onChange={(e) => update("sintomas", e.target.value)} /></div>
+
+          <div className="gi-primary" style={sectionTitle}><Droplet size={13} /> Histórico menstrual e contraceptivo</div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <div><label className="gi-text-soft" style={fieldLabelStyle}>Data da última menstruação (DUM)</label><input type="date" className="gi-input" style={inputStyle} value={form.dum} onChange={(e) => update("dum", e.target.value)} /></div>
+            <div><label className="gi-text-soft" style={fieldLabelStyle}>Ciclo menstrual</label><input className="gi-input" style={inputStyle} value={form.cicloMenstrual} onChange={(e) => update("cicloMenstrual", e.target.value)} placeholder="Ex.: regular, 28 dias" /></div>
+          </div>
+          <div><label className="gi-text-soft" style={fieldLabelStyle}>Histórico contraceptivo</label><input className="gi-input" style={inputStyle} value={form.historicoContraceptivo} onChange={(e) => update("historicoContraceptivo", e.target.value)} /></div>
+
+          <div className="gi-primary" style={sectionTitle}><Baby size={13} /> Histórico obstétrico</div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 12 }}>
+            <div><label className="gi-text-soft" style={fieldLabelStyle}>Gestações (G)</label><input type="number" min="0" className="gi-input" style={inputStyle} value={form.gestacoes} onChange={(e) => update("gestacoes", e.target.value)} /></div>
+            <div><label className="gi-text-soft" style={fieldLabelStyle}>Partos (P)</label><input type="number" min="0" className="gi-input" style={inputStyle} value={form.partos} onChange={(e) => update("partos", e.target.value)} /></div>
+            <div><label className="gi-text-soft" style={fieldLabelStyle}>Abortos (A)</label><input type="number" min="0" className="gi-input" style={inputStyle} value={form.abortos} onChange={(e) => update("abortos", e.target.value)} /></div>
+          </div>
+
+          <div className="gi-primary" style={sectionTitle}><HeartPulse size={13} /> Antecedentes e uso de medicamentos</div>
+          <div><label className="gi-text-soft" style={fieldLabelStyle}>Histórico sexual (quando pertinente)</label><input className="gi-input" style={inputStyle} value={form.historicoSexual} onChange={(e) => update("historicoSexual", e.target.value)} placeholder="Opcional" /></div>
+          <div><label className="gi-text-soft" style={fieldLabelStyle}>Antecedentes pessoais</label><textarea className="gi-input" style={taStyle} value={form.antecedentesPessoais} onChange={(e) => update("antecedentesPessoais", e.target.value)} /></div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <div><label className="gi-text-soft" style={fieldLabelStyle}>Alergias</label><input className="gi-input" style={inputStyle} value={form.alergias} onChange={(e) => update("alergias", e.target.value)} /></div>
+            <div><label className="gi-text-soft" style={fieldLabelStyle}>Medicamentos em uso</label><input className="gi-input" style={inputStyle} value={form.medicamentos} onChange={(e) => update("medicamentos", e.target.value)} /></div>
+          </div>
+
+          <div className="gi-primary" style={sectionTitle}><Stethoscope size={13} /> Exame clínico</div>
+          <div><label className="gi-text-soft" style={fieldLabelStyle}>Exame físico</label><textarea className="gi-input" style={taStyle} value={form.exameFisico} onChange={(e) => update("exameFisico", e.target.value)} /></div>
+          <div><label className="gi-text-soft" style={fieldLabelStyle}>Sinais vitais</label><input className="gi-input" style={inputStyle} value={form.sinaisVitais} onChange={(e) => update("sinaisVitais", e.target.value)} placeholder="PA, FC, peso..." /></div>
+
+          <div className="gi-primary" style={sectionTitle}><FileText size={13} /> Diagnóstico e conduta</div>
+          <div><label className="gi-text-soft" style={fieldLabelStyle}>Diagnósticos</label><textarea className="gi-input" style={taStyle} value={form.diagnosticos} onChange={(e) => update("diagnosticos", e.target.value)} /></div>
+          <div><label className="gi-text-soft" style={fieldLabelStyle}>Evolução clínica</label><textarea className="gi-input" style={taStyle} value={form.evolucaoClinica} onChange={(e) => update("evolucaoClinica", e.target.value)} /></div>
+          <div><label className="gi-text-soft" style={fieldLabelStyle}>Conduta médica</label><textarea className="gi-input" style={taStyle} value={form.condutaMedica} onChange={(e) => update("condutaMedica", e.target.value)} /></div>
+          <div><label className="gi-text-soft" style={fieldLabelStyle}>Histórico de procedimentos</label><textarea className="gi-input" style={taStyle} value={form.historicoProcedimentos} onChange={(e) => update("historicoProcedimentos", e.target.value)} /></div>
+          <div><label className="gi-text-soft" style={fieldLabelStyle}>Observações</label><textarea className="gi-input" style={taStyle} value={form.observacoes} onChange={(e) => update("observacoes", e.target.value)} /></div>
+
+          <div style={{ display: "flex", gap: 10, marginTop: 4 }}>
+            <button type="button" onClick={onClose} className="gi-btn-ghost" style={{ flex: 1, padding: 11, borderRadius: 10, fontSize: "0.86rem" }}>Cancelar</button>
+            <button type="submit" className="gi-btn-primary" style={{ flex: 2, padding: 11, borderRadius: 10, fontSize: "0.86rem" }}>{isEdit ? "Salvar alterações" : "Salvar registro"}</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+function RecordsPage({ patients, records, onSave }) {
+  const [query, setQuery] = useState("");
+  const filtered = records.filter((r) => r.patientName.toLowerCase().includes(query.trim().toLowerCase())).sort((a, b) => b.date.localeCompare(a.date));
+
+  return (
+    <div className="gi-fade-in" style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div style={{ position: "relative", maxWidth: 340 }}>
+        <Search size={15} className="gi-text-faint" style={{ position: "absolute", left: 12, top: "50%", transform: "translateY(-50%)" }} />
+        <input className="gi-input" placeholder="Pesquisar por paciente..." value={query} onChange={(e) => setQuery(e.target.value)} style={{ width: "100%", padding: "9px 12px 9px 34px", borderRadius: 9, fontSize: "0.84rem" }} />
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        {filtered.length === 0 && <div className="gi-text-faint" style={{ fontSize: "0.84rem" }}>Nenhum registro encontrado. Abra uma paciente e acesse a aba "Prontuário" para criar o primeiro registro.</div>}
+        {filtered.map((r) => (
+          <div key={r.id} className="gi-panel" style={{ borderRadius: 14, padding: 16 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+              <div className="gi-text" style={{ fontWeight: 700, fontSize: "0.9rem" }}>{r.patientName}</div>
+              <div className="gi-text-faint" style={{ fontSize: "0.76rem" }}>{fmtDateLong(r.date)}</div>
+            </div>
+            <div className="gi-text-soft" style={{ fontSize: "0.82rem" }}><strong>Diagnóstico:</strong> {r.diagnosticos || "—"}</div>
+            <div className="gi-text-soft" style={{ fontSize: "0.82rem" }}><strong>Conduta:</strong> {r.condutaMedica || "—"}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ============================= APP ROOT ============================= */
+
+export default function GinecoIsabelaApp() {
+  const [theme, setTheme] = useState("light");
+  const [authed, setAuthed] = useState(false);
+  const [userEmail, setUserEmail] = useState("");
+  const [role, setRole] = useState("Médica");
+  const [active, setActive] = useState("dashboard");
+  const [patients, setPatients] = useState([]);
+  const [appointments, setAppointments] = useState([]);
+  const [records, setRecords] = useState([]);
+  const [ready, setReady] = useState(false);
+  const [recordModal, setRecordModal] = useState(null); // { editing, defaultPatientId } | null
+
+  useEffect(() => {
+    (async () => {
+      const t = await loadJSON("gineco:theme", "light");
+      setTheme(t);
+      const p = await loadJSON("gineco:patients", null);
+      const a = await loadJSON("gineco:appointments", null);
+      const rc = await loadJSON("gineco:records", null);
+      const finalPatients = p || seedPatients();
+      const finalAppts = a || seedAppointments();
+      const finalRecords = rc || seedRecords();
+      setPatients(finalPatients); setAppointments(finalAppts); setRecords(finalRecords);
+      if (!p) saveJSON("gineco:patients", finalPatients);
+      if (!a) saveJSON("gineco:appointments", finalAppts);
+      if (!rc) saveJSON("gineco:records", finalRecords);
+      setReady(true);
+    })();
+  }, []);
+
+  useEffect(() => { if (ready) saveJSON("gineco:theme", theme); }, [theme, ready]);
+  useEffect(() => { if (ready) saveJSON("gineco:patients", patients); }, [patients, ready]);
+  useEffect(() => { if (ready) saveJSON("gineco:appointments", appointments); }, [appointments, ready]);
+  useEffect(() => { if (ready) saveJSON("gineco:records", records); }, [records, ready]);
+
+  function toggleTheme() { setTheme((t) => (t === "dark" ? "light" : "dark")); }
+
+  function quickAddPatient(name) {
+    const p = { id: `pt${Date.now()}`, name, cpf: "", birthDate: "", phone: "", whatsapp: "", email: "", address: "", emergencyContact: "", alergias: "", medicamentos: "", antecedentesFamiliares: "", archived: false };
+    setPatients((prev) => [...prev, p]);
+    return p;
+  }
+  function savePatient(patient) {
+    setPatients((prev) => prev.some((p) => p.id === patient.id) ? prev.map((p) => p.id === patient.id ? patient : p) : [...prev, patient]);
+  }
+  function archivePatient(patient) {
+    setPatients((prev) => prev.map((p) => p.id === patient.id ? { ...p, archived: !p.archived } : p));
+  }
+  function saveRecord(rc) {
+    setRecords((prev) => prev.some((r) => r.id === rc.id) ? prev.map((r) => r.id === rc.id ? rc : r) : [...prev, rc]);
+  }
+
+  if (!ready) {
+    return (
+      <div className="gi-root theme-light gi-bg" style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <ThemeStyles />
+        <div className="gi-text-soft" style={{ fontSize: "0.9rem" }}>Carregando sistema…</div>
+      </div>
+    );
+  }
+
+  if (!authed) {
+    return <LoginScreen theme={theme} toggleTheme={toggleTheme} onLogin={({ email, role }) => { setUserEmail(email); setRole(role); setAuthed(true); }} />;
+  }
+
+  const canSeeProntuario = ROLE_PERMISSIONS[role]?.prontuario !== "none";
+  const activePatients = patients.filter((p) => !p.archived);
+
+  return (
+    <Shell theme={theme} toggleTheme={toggleTheme} active={active} setActive={setActive} role={role} onLogout={() => setAuthed(false)} userEmail={userEmail}>
+      {active === "dashboard" && <Dashboard patients={patients} appointments={appointments} userEmail={userEmail} role={role} setActive={setActive} />}
+      {active === "agenda" && <Agenda patients={activePatients} appointments={appointments} setAppointments={setAppointments} quickAddPatient={quickAddPatient} />}
+      {active === "pacientes" && (
+        <PatientsPage
+          patients={patients} appointments={appointments} records={records} role={role}
+          onSave={savePatient} onArchive={archivePatient}
+          onOpenRecord={(r, patientId) => setRecordModal({ editing: r, defaultPatientId: patientId })}
+        />
+      )}
+      {active === "prontuarios" && (
+        canSeeProntuario
+          ? <RecordsPage patients={activePatients} records={records} onSave={saveRecord} />
+          : <RestrictedView moduleLabel="O módulo de Prontuário" />
+      )}
+
+      {recordModal && (
+        <RecordModal
+          initial={recordModal.editing} defaultPatientId={recordModal.defaultPatientId} patients={activePatients}
+          onSave={(rc) => { saveRecord(rc); setRecordModal(null); }} onClose={() => setRecordModal(null)}
+        />
+      )}
+    </Shell>
+  );
+}
